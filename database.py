@@ -3,7 +3,8 @@ import hashlib
 import secrets
 from datetime import datetime, timedelta
 
-DB_NAME = "finance.db"
+import os
+DB_NAME = "/data/finance.db"
 
 
 # ============================================================
