@@ -66,7 +66,7 @@ from database import (
 # ============================================================
 #                       НАСТРОЙКИ
 # ============================================================
-BOT_TOKEN = "8832121773:AAFUs9DsIZsTW_SQ3BCj6Q7wa-pxUNX4X5g"
+BOT_TOKEN = os.getenv("BOT_TOKEN")
 EXPORTS_DIR = "exports"
 
 WEEKDAYS_RU = ["Пн", "Вт", "Ср", "Чт", "Пт", "Сб", "Вс"]
