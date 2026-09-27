@@ -1,3 +1,4 @@
+import os
 import sqlite3
 import hashlib
 import secrets
@@ -1441,3 +1442,142 @@ def get_all_requests_for_user(target_id: int, limit: int = 30):
     rows = cur.fetchall()
     conn.close()
     return rows
+
+
+# ============================================================
+#               ПОЛЬЗОВАТЕЛЬСКИЕ КАТЕГОРИИ
+# ============================================================
+DEFAULT_CATEGORIES = {
+    "expense": ["Личные траты"],
+    "income": ["Заработная плата", "Сторонние"],
+    "invest": ["Акции", "Облигации", "Крипта", "ETF", "Недвижимость", "Другое"],
+    "profit_source": ["Дивиденды", "Купоны", "Продажа", "Проценты", "Другое"],
+}
+
+
+def init_categories_table():
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("""
+        CREATE TABLE IF NOT EXISTS categories (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER NOT NULL,
+            kind TEXT NOT NULL,
+            name TEXT NOT NULL,
+            position INTEGER DEFAULT 0,
+            created_at TEXT NOT NULL,
+            UNIQUE(user_id, kind, name)
+        )
+    """)
+    conn.commit()
+    conn.close()
+
+
+def ensure_default_categories(user_id: int):
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    for kind, names in DEFAULT_CATEGORIES.items():
+        cur.execute("""
+            SELECT COUNT(*) FROM categories WHERE user_id = ? AND kind = ?
+        """, (user_id, kind))
+        if cur.fetchone()[0] == 0:
+            for i, name in enumerate(names):
+                cur.execute("""
+                    INSERT OR IGNORE INTO categories
+                        (user_id, kind, name, position, created_at)
+                    VALUES (?, ?, ?, ?, ?)
+                """, (user_id, kind, name, i, now))
+    conn.commit()
+    conn.close()
+
+
+def get_categories(user_id: int, kind: str):
+    ensure_default_categories(user_id)
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT name FROM categories
+        WHERE user_id = ? AND kind = ?
+        ORDER BY position ASC, id ASC
+    """, (user_id, kind))
+    rows = [r[0] for r in cur.fetchall()]
+    conn.close()
+    return rows
+
+
+def add_category(user_id: int, kind: str, name: str):
+    name = name.strip()
+    if not name:
+        return False, "Название не может быть пустым."
+    if len(name) > 40:
+        return False, "Название не длиннее 40 символов."
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COUNT(*) FROM categories WHERE user_id = ? AND kind = ?
+    """, (user_id, kind))
+    cnt = cur.fetchone()[0]
+    if cnt >= 30:
+        conn.close()
+        return False, "Максимум 30 категорий на раздел."
+    cur.execute("""
+        SELECT id FROM categories WHERE user_id = ? AND kind = ? AND name = ?
+    """, (user_id, kind, name))
+    if cur.fetchone():
+        conn.close()
+        return False, "Такая категория уже есть."
+    cur.execute("""
+        INSERT INTO categories (user_id, kind, name, position, created_at)
+        VALUES (?, ?, ?, ?, ?)
+    """, (user_id, kind, name, cnt,
+          datetime.now().strftime("%Y-%m-%d %H:%M:%S")))
+    conn.commit()
+    conn.close()
+    return True, "Категория добавлена."
+
+
+def delete_category(user_id: int, kind: str, name: str):
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT COUNT(*) FROM categories WHERE user_id = ? AND kind = ?
+    """, (user_id, kind))
+    if cur.fetchone()[0] <= 1:
+        conn.close()
+        return False, "Нельзя удалить последнюю категорию."
+    cur.execute("""
+        DELETE FROM categories WHERE user_id = ? AND kind = ? AND name = ?
+    """, (user_id, kind, name))
+    deleted = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    if not deleted:
+        return False, "Категория не найдена."
+    return True, "Категория удалена."
+
+
+def rename_category(user_id: int, kind: str, old_name: str, new_name: str):
+    new_name = new_name.strip()
+    if not new_name:
+        return False, "Название не может быть пустым."
+    if len(new_name) > 40:
+        return False, "Название не длиннее 40 символов."
+    conn = sqlite3.connect(DB_NAME)
+    cur = conn.cursor()
+    cur.execute("""
+        SELECT id FROM categories WHERE user_id = ? AND kind = ? AND name = ?
+    """, (user_id, kind, new_name))
+    if cur.fetchone():
+        conn.close()
+        return False, "Такая категория уже есть."
+    cur.execute("""
+        UPDATE categories SET name = ?
+        WHERE user_id = ? AND kind = ? AND name = ?
+    """, (new_name, user_id, kind, old_name))
+    updated = cur.rowcount > 0
+    conn.commit()
+    conn.close()
+    if not updated:
+        return False, "Категория не найдена."
+    return True, "Переименовано."
