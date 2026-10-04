@@ -1780,4 +1780,1012 @@ async def shifts_menu(message: Message, state: FSMContext):
                          reply_markup=shifts_menu_kb(s["auto_report_enabled"]))
 
 
-@dp
+@dp.callback_query(F.data == "shift:menu")
+async def shifts_menu_cb(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    s = get_shift_settings(uid(call))
+    await call.message.edit_text("🕐 <b>Смены</b>", parse_mode="HTML",
+                                 reply_markup=shifts_menu_kb(s["auto_report_enabled"]))
+    await call.answer()
+
+
+@dp.callback_query(F.data == "shift:auto_report")
+async def auto_report_toggle(call: CallbackQuery, state: FSMContext):
+    s = get_shift_settings(uid(call))
+    new_val = 0 if s["auto_report_enabled"] else 1
+    save_shift_settings(uid(call), auto_report_enabled=new_val)
+    await call.answer("Автоотчёт " + ("включён" if new_val else "выключен"))
+    await shifts_menu_cb(call, state)
+
+
+@dp.callback_query(F.data == "shift:add")
+async def shift_add_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(ShiftFlow.role)
+    s = get_shift_settings(uid(call))
+    await call.message.edit_text("Выберите должность:",
+                                 reply_markup=shift_role_kb(s))
+    await call.answer()
+
+
+@dp.callback_query(ShiftFlow.role, F.data.startswith("shift:role:"))
+async def shift_role_chosen(call: CallbackQuery, state: FSMContext):
+    role_key = call.data.split(":")[2]
+    info = get_role_info(uid(call), role_key)
+    if not info:
+        await call.answer("Неизвестная должность.", show_alert=True)
+        return
+    await state.update_data(role_key=role_key)
+    await state.set_state(ShiftFlow.hours)
+    await call.message.edit_text(
+        f"Должность: <b>{info['title']}</b>\n"
+        f"Ставка: <b>{info['rate']:g} ₽/час</b>\n\n"
+        f"Сколько часов отработано?",
+        parse_mode="HTML")
+    await call.answer()
+
+
+@dp.message(ShiftFlow.hours)
+async def shift_hours_input(message: Message, state: FSMContext):
+    try:
+        hours = float(message.text.replace(",", ".").strip())
+        if hours <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❗ Введите положительное число часов.")
+        return
+    data = await state.get_data()
+    role_key = data.get("role_key")
+    info = get_role_info(uid(message), role_key)
+    salary = hours * info["rate"]
+    await state.update_data(hours=hours, salary=salary)
+    await state.set_state(ShiftFlow.bonus)
+
+    if info["default_bonus"] is not None:
+        await message.answer(
+            f"Оклад: <b>{hours:g} ч × {info['rate']:g} ₽ = "
+            f"{salary:g} ₽</b>\n\n"
+            f"Премия по умолчанию: <b>{info['default_bonus']:g} ₽</b>\n\n"
+            f"Введите премию числом (или <code>-</code>, чтобы оставить "
+            f"{info['default_bonus']:g} ₽).",
+            parse_mode="HTML")
+    else:
+        await message.answer(
+            f"Оклад: <b>{hours:g} ч × {info['rate']:g} ₽ = "
+            f"{salary:g} ₽</b>\n\nВведите сумму премии:",
+            parse_mode="HTML")
+
+
+@dp.message(ShiftFlow.bonus)
+async def shift_bonus_input(message: Message, state: FSMContext):
+    raw = message.text.strip().replace(",", ".")
+    data = await state.get_data()
+    role_key = data.get("role_key")
+    user_id = uid(message)
+    info = get_role_info(user_id, role_key)
+
+    if raw == "-":
+        if info["default_bonus"] is None:
+            await message.answer("❗ Введите премию числом.")
+            return
+        bonus = float(info["default_bonus"])
+    else:
+        try:
+            bonus = float(raw)
+            if bonus < 0:
+                raise ValueError
+        except ValueError:
+            await message.answer("❗ Введите неотрицательное число.")
+            return
+
+    hours = data["hours"]
+    salary = data["salary"]
+    shift_id, number, sal, bon, total = add_shift(
+        user_id, role_key, hours, bonus)
+    distribute_shift_to_goals(user_id, total, sign=1)
+    await state.clear()
+
+    saved_now = get_system_goal_current(user_id, SAVED_BUDGET_NAME)
+    future_now = get_system_goal_current(user_id, FUTURE_BUDGET_NAME)
+
+    await message.answer(
+        f"✅ <b>{number}</b>\n"
+        f"Дата: {datetime.now().strftime('%Y-%m-%d %H:%M')}\n"
+        f"Должность: <b>{info['title']}</b>\n"
+        f"Часов: {hours:g} × {info['rate']:g} ₽ = {salary:g} ₽\n"
+        f"Премия: {bonus:g} ₽\n"
+        f"<b>Сумма: {total:g} ₽</b>\n\n"
+        f"📊 Распределение:\n"
+        f"  • 75% → «{SAVED_BUDGET_NAME}»: <b>+{total * 0.75:g} ₽</b> "
+        f"(итого: {saved_now:g} ₽)\n"
+        f"  • 25% → «{FUTURE_BUDGET_NAME}»: <b>+{total * 0.25:g} ₽</b> "
+        f"(итого: {future_now:g} ₽)",
+        parse_mode="HTML", reply_markup=main_menu_kb())
+
+
+@dp.callback_query(F.data == "shift:list")
+async def shift_list_months(call: CallbackQuery, state: FSMContext):
+    months = get_months(uid(call))
+    if not months:
+        await call.message.edit_text("Нет данных о сменах.",
+                                     reply_markup=shifts_menu_kb(
+                                         get_shift_settings(uid(call))["auto_report_enabled"]))
+        await call.answer()
+        return
+    buttons = [[InlineKeyboardButton(
+        text=f"{m.split('-')[1]}.{m.split('-')[0]}",
+        callback_data=f"shift:list_month:{m}")]
+        for m in months]
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад",
+                                         callback_data="shift:menu")])
+    await call.message.edit_text("Выберите месяц:",
+                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("shift:list_month:"))
+async def shift_list_month(call: CallbackQuery, state: FSMContext):
+    month = call.data.split(":", 2)[2]
+    user_id = uid(call)
+    shifts = get_shifts_for_month(user_id, month)
+    fines = get_fines_for_month(user_id, month)
+
+    if not shifts and not fines:
+        await call.message.edit_text(
+            f"За {month} смен нет.",
+            reply_markup=shifts_menu_kb(
+                get_shift_settings(user_id)["auto_report_enabled"]))
+        await call.answer()
+        return
+
+    total_sal = sum(s[6] for s in shifts)
+    total_bonus = sum(s[7] for s in shifts)
+    total_all = sum(s[8] for s in shifts)
+    total_fines = sum(f[1] for f in fines)
+
+    lines = [f"📋 <b>Смены за {month}</b>\n"]
+    lines.append(f"Количество смен: <b>{len(shifts)}</b>")
+    lines.append(f"Оклады: <b>{total_sal:g}</b> ₽")
+    lines.append(f"Премии: <b>{total_bonus:g}</b> ₽")
+    lines.append(f"Итого: <b>{total_all:g}</b> ₽")
+    if total_fines:
+        lines.append(f"Штрафы: <b>-{total_fines:g}</b> ₽")
+        lines.append(f"К выплате: <b>{total_all - total_fines:g}</b> ₽")
+    lines.append("")
+
+    for (sid, number, rkey, rtitle, hours, rate,
+         salary, bonus, total, created) in shifts:
+        lines.append(
+            f"<b>{number}</b>\n"
+            f"  📅 {created[:16]}\n"
+            f"  👔 {rtitle}\n"
+            f"  💰 Оклад: {salary:g} ₽ | Премия: {bonus:g} ₽ | "
+            f"<b>Итого {total:g} ₽</b>")
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n…"
+
+    await call.message.edit_text(text, parse_mode="HTML",
+                                 reply_markup=shifts_list_kb(shifts))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("shift:view:"))
+async def shift_view(call: CallbackQuery, state: FSMContext):
+    sid = int(call.data.split(":")[2])
+    s = get_shift(sid, uid(call))
+    if not s:
+        await call.answer("Смена не найдена.", show_alert=True)
+        return
+    (_, number, rkey, rtitle, hours, rate,
+     salary, bonus, total, created) = s
+    await call.message.edit_text(
+        f"<b>{number}</b>\n"
+        f"📅 {created[:16]}\n"
+        f"👔 {rtitle}\n"
+        f"⏱ {hours:g} ч × {rate:g} ₽ = {salary:g} ₽\n"
+        f"🎁 Премия: {bonus:g} ₽\n"
+        f"<b>Сумма: {total:g} ₽</b>\n\n"
+        f"Распределение: 75% / 25%",
+        parse_mode="HTML",
+        reply_markup=shift_edit_kb(sid))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("shift:edit_salary:"))
+async def shift_edit_salary(call: CallbackQuery, state: FSMContext):
+    sid = int(call.data.split(":")[2])
+    await state.set_state(ShiftEditFlow.salary)
+    await state.update_data(shift_id=sid)
+    await call.message.edit_text("Введите новый оклад (₽):")
+    await call.answer()
+
+
+@dp.message(ShiftEditFlow.salary)
+async def shift_edit_salary_input(message: Message, state: FSMContext):
+    try:
+        v = float(message.text.replace(",", ".").strip())
+        if v < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❗ Введите неотрицательное число.")
+        return
+    data = await state.get_data()
+    sid = data["shift_id"]
+    user_id = uid(message)
+    old = get_shift(sid, user_id)
+    if not old:
+        await message.answer("Смена не найдена.", reply_markup=main_menu_kb())
+        await state.clear()
+        return
+    old_total = old[8]
+    result = update_shift(sid, user_id, new_salary=v)
+    new_total = result[2]
+    distribute_shift_to_goals(user_id, old_total, sign=-1)
+    distribute_shift_to_goals(user_id, new_total, sign=1)
+    await state.clear()
+    await message.answer(
+        f"✅ Оклад обновлён: {v:g} ₽\n"
+        f"Новая сумма смены: <b>{new_total:g} ₽</b>\n"
+        f"Распределение пересчитано.",
+        parse_mode="HTML", reply_markup=main_menu_kb())
+
+
+@dp.callback_query(F.data.startswith("shift:edit_bonus:"))
+async def shift_edit_bonus(call: CallbackQuery, state: FSMContext):
+    sid = int(call.data.split(":")[2])
+    await state.set_state(ShiftEditFlow.bonus)
+    await state.update_data(shift_id=sid)
+    await call.message.edit_text("Введите новую премию (₽):")
+    await call.answer()
+
+
+@dp.message(ShiftEditFlow.bonus)
+async def shift_edit_bonus_input(message: Message, state: FSMContext):
+    try:
+        v = float(message.text.replace(",", ".").strip())
+        if v < 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❗ Введите неотрицательное число.")
+        return
+    data = await state.get_data()
+    sid = data["shift_id"]
+    user_id = uid(message)
+    old = get_shift(sid, user_id)
+    if not old:
+        await message.answer("Смена не найдена.", reply_markup=main_menu_kb())
+        await state.clear()
+        return
+    old_total = old[8]
+    result = update_shift(sid, user_id, new_bonus=v)
+    new_total = result[2]
+    distribute_shift_to_goals(user_id, old_total, sign=-1)
+    distribute_shift_to_goals(user_id, new_total, sign=1)
+    await state.clear()
+    await message.answer(
+        f"✅ Премия обновлена: {v:g} ₽\n"
+        f"Новая сумма смены: <b>{new_total:g} ₽</b>\n"
+        f"Распределение пересчитано.",
+        parse_mode="HTML", reply_markup=main_menu_kb())
+
+
+@dp.callback_query(F.data.startswith("shift:del:"))
+async def shift_del(call: CallbackQuery, state: FSMContext):
+    sid = int(call.data.split(":")[2])
+    user_id = uid(call)
+    s = get_shift(sid, user_id)
+    if not s:
+        await call.answer("Смена не найдена.", show_alert=True)
+        return
+    total = s[8]
+    distribute_shift_to_goals(user_id, total, sign=-1)
+    delete_shift(sid, user_id)
+    await call.message.edit_text(
+        "🗑 Смена удалена, распределение откатилось.",
+        reply_markup=shifts_menu_kb(
+            get_shift_settings(user_id)["auto_report_enabled"]))
+    await call.answer()
+
+
+# ---------- ШТРАФЫ ----------
+@dp.callback_query(F.data == "shift:fine")
+async def fine_start(call: CallbackQuery, state: FSMContext):
+    await state.set_state(FineFlow.amount)
+    await call.message.edit_text(
+        f"💸 Введите сумму штрафа (спишется с бюджета "
+        f"«{FUTURE_BUDGET_NAME}»):")
+    await call.answer()
+
+
+@dp.message(FineFlow.amount)
+async def fine_amount(message: Message, state: FSMContext):
+    try:
+        v = float(message.text.replace(",", ".").strip())
+        if v <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❗ Введите положительное число.")
+        return
+    await state.update_data(amount=v)
+    await state.set_state(FineFlow.reason)
+    await message.answer("Укажите причину штрафа:")
+
+
+@dp.message(FineFlow.reason)
+async def fine_reason(message: Message, state: FSMContext):
+    data = await state.get_data()
+    user_id = uid(message)
+    add_fine(user_id, data["amount"], message.text.strip())
+    add_fine_to_future_goal(user_id, data["amount"], message.text.strip())
+    await state.clear()
+    future_now = get_system_goal_current(user_id, FUTURE_BUDGET_NAME)
+    await message.answer(
+        f"✅ Штраф <b>{data['amount']:g}</b> ₽ учтён.\n"
+        f"Причина: {message.text.strip()}\n\n"
+        f"Остаток в бюджете «{FUTURE_BUDGET_NAME}»: "
+        f"<b>{future_now:g}</b> ₽",
+        parse_mode="HTML", reply_markup=main_menu_kb())
+
+
+# ---------- ЭКСПОРТ CSV ----------
+@dp.callback_query(F.data == "shift:csv")
+async def shift_csv_menu(call: CallbackQuery, state: FSMContext):
+    months = get_months(uid(call))
+    if not months:
+        await call.answer("Нет данных.", show_alert=True)
+        return
+    buttons = [[InlineKeyboardButton(
+        text=f"{m.split('-')[1]}.{m.split('-')[0]}",
+        callback_data=f"shift:csv_month:{m}")]
+        for m in months]
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад",
+                                         callback_data="shift:menu")])
+    await call.message.edit_text("Выберите месяц для экспорта:",
+                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("shift:csv_month:"))
+async def shift_csv_export(call: CallbackQuery, state: FSMContext):
+    month = call.data.split(":", 2)[2]
+    shifts = get_shifts_for_month(uid(call), month)
+    fines = get_fines_for_month(uid(call), month)
+
+    lines = ["Номер;Дата;Должность;Часы;Ставка;Оклад;Премия;Итого"]
+    total_sal = 0
+    total_bonus = 0
+    total_all = 0
+    for (sid, number, rkey, rtitle, hours, rate,
+         salary, bonus, total, created) in shifts:
+        total_sal += salary
+        total_bonus += bonus
+        total_all += total
+        lines.append(
+            f"{number};{created[:16]};{rtitle};{hours:g};{rate:g};"
+            f"{salary:g};{bonus:g};{total:g}")
+    lines.append("")
+    lines.append(f";;;;ИТОГО ОКЛАДОВ;;;{total_sal:g}")
+    lines.append(f";;;;ИТОГО ПРЕМИЙ;;;{total_bonus:g}")
+    lines.append(f";;;;ИТОГО;;;{total_all:g}")
+
+    if fines:
+        lines.append("")
+        lines.append("Штрафы:")
+        lines.append("Дата;Сумма;Причина")
+        for fid, amount, reason, created in fines:
+            lines.append(f"{created[:16]};{amount:g};{reason}")
+        total_fines = sum(f[1] for f in fines)
+        lines.append(f";ИТОГО ШТРАФОВ;{total_fines:g}")
+        lines.append(f";К ВЫПЛАТЕ;{total_all - total_fines:g}")
+
+    csv_data = "\n".join(lines).encode("utf-8-sig")
+    file = BufferedInputFile(csv_data, filename=f"shifts_{month}.csv")
+    await call.message.answer_document(file,
+                                       caption=f"📤 Экспорт смен за {month}")
+    await call.answer()
+
+
+# ---------- СТАВКИ ----------
+def rates_menu_kb(s):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(
+            text=f"Специалист ОПП: ставка {s['opp_rate']:g} ₽/ч",
+            callback_data="rates:opp_rate")],
+        [InlineKeyboardButton(
+            text=f"Специалист ОПП: премия {s['opp_bonus']:g} ₽",
+            callback_data="rates:opp_bonus")],
+        [InlineKeyboardButton(
+            text=f"Кассир-продавец: {s['cashier_rate']:g} ₽/ч",
+            callback_data="rates:cashier_rate")],
+        [InlineKeyboardButton(
+            text=f"И.О. Администратора: {s['admin_rate']:g} ₽/ч",
+            callback_data="rates:admin_rate")],
+        [InlineKeyboardButton(text="⬅️ Назад",
+                              callback_data="shift:menu")],
+    ])
+
+
+@dp.callback_query(F.data == "shift:rates")
+async def rates_menu(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    s = get_shift_settings(uid(call))
+    await call.message.edit_text("⚙️ <b>Настройка ставок</b>",
+                                 parse_mode="HTML",
+                                 reply_markup=rates_menu_kb(s))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("rates:"))
+async def rates_pick(call: CallbackQuery, state: FSMContext):
+    field = call.data.split(":")[1]
+    mapping = {
+        "opp_rate": (RateFlow.opp_rate,
+                     "Введите ставку Специалиста ОПП (₽/ч):"),
+        "opp_bonus": (RateFlow.opp_bonus,
+                      "Введите премию Специалиста ОПП (₽):"),
+        "cashier_rate": (RateFlow.cashier_rate,
+                         "Введите ставку Кассира-продавца (₽/ч):"),
+        "admin_rate": (RateFlow.admin_rate,
+                       "Введите ставку И.О. Администратора (₽/ч):"),
+    }
+    if field not in mapping:
+        await call.answer("Неизвестный параметр.")
+        return
+    state_obj, question = mapping[field]
+    await state.set_state(state_obj)
+    await call.message.edit_text(question)
+    await call.answer()
+
+
+@dp.message(RateFlow.opp_rate)
+async def rate_opp_rate(message: Message, state: FSMContext):
+    await _save_rate(message, state, "opp_rate")
+
+
+@dp.message(RateFlow.opp_bonus)
+async def rate_opp_bonus(message: Message, state: FSMContext):
+    await _save_rate(message, state, "opp_bonus")
+
+
+@dp.message(RateFlow.cashier_rate)
+async def rate_cashier(message: Message, state: FSMContext):
+    await _save_rate(message, state, "cashier_rate")
+
+
+@dp.message(RateFlow.admin_rate)
+async def rate_admin(message: Message, state: FSMContext):
+    await _save_rate(message, state, "admin_rate")
+
+
+async def _save_rate(message: Message, state: FSMContext, field: str):
+    try:
+        v = float(message.text.replace(",", ".").strip())
+        if v <= 0:
+            raise ValueError
+    except ValueError:
+        await message.answer("❗ Введите положительное число.")
+        return
+    save_shift_settings(uid(message), **{field: v})
+    await state.clear()
+    s = get_shift_settings(uid(message))
+    await message.answer("✅ Ставка обновлена.",
+                         reply_markup=rates_menu_kb(s))
+
+
+# ---------- ОТЧЁТ ЗА МЕСЯЦ ----------
+def month_names_ru():
+    return {
+        "01": "Январь", "02": "Февраль", "03": "Март", "04": "Апрель",
+        "05": "Май", "06": "Июнь", "07": "Июль", "08": "Август",
+        "09": "Сентябрь", "10": "Октябрь", "11": "Ноябрь", "12": "Декабрь",
+    }
+
+
+@dp.callback_query(F.data == "shift:report")
+async def month_report_menu(call: CallbackQuery, state: FSMContext):
+    await call.message.edit_text(
+        "📅 <b>Отчёт за месяц</b>\n\nВыберите действие:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🆕 Сформировать за месяц",
+                                  callback_data="mreport:create")],
+            [InlineKeyboardButton(text="📜 История отчётов",
+                                  callback_data="mreport:history")],
+            [InlineKeyboardButton(text="⬅️ Назад",
+                                  callback_data="shift:menu")],
+        ]))
+    await call.answer()
+
+
+@dp.callback_query(F.data == "mreport:create")
+async def mreport_create(call: CallbackQuery, state: FSMContext):
+    months = get_months(uid(call))
+    if not months:
+        await call.answer("Нет данных.", show_alert=True)
+        return
+    buttons = [[InlineKeyboardButton(
+        text=f"{m.split('-')[1]}.{m.split('-')[0]}",
+        callback_data=f"mreport:month:{m}")]
+        for m in months]
+    buttons.append([InlineKeyboardButton(text="⬅️ Назад",
+                                         callback_data="shift:report")])
+    await call.message.edit_text("Выберите месяц для формирования отчёта:",
+                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("mreport:month:"))
+async def mreport_show(call: CallbackQuery, state: FSMContext):
+    month = call.data.split(":", 2)[2]
+    user_id = uid(call)
+
+    totals = get_month_totals(user_id, month)
+    spent = totals["expense"]
+    saved = get_system_goal_current(user_id, SAVED_BUDGET_NAME)
+    earned = get_system_goal_current(user_id, FUTURE_BUDGET_NAME)
+    save_monthly_report(user_id, month, spent, earned, saved)
+
+    y, m = month.split("-")
+    title = f"{month_names_ru().get(m, m)} {y}"
+    text = (
+        f"📅 <b>Отчёт за {title}</b>\n\n"
+        f"💸 Потрачено средств: <b>{spent:g}</b> ₽\n"
+        f"💰 Заработано средств: <b>{earned:g}</b> ₽\n"
+        f"   <i>(из бюджета «{FUTURE_BUDGET_NAME}»)</i>\n"
+        f"🏦 Отложенные средства: <b>{saved:g}</b> ₽\n"
+        f"   <i>(из бюджета «{SAVED_BUDGET_NAME}»)</i>"
+    )
+    await call.message.edit_text(text, parse_mode="HTML",
+                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                     [InlineKeyboardButton(text="⬅️ Назад",
+                                                           callback_data="shift:report")]]))
+    await call.answer()
+
+
+@dp.callback_query(F.data == "mreport:history")
+async def mreport_history(call: CallbackQuery, state: FSMContext):
+    rows = get_all_monthly_reports(uid(call))
+    if not rows:
+        await call.message.edit_text(
+            "Пока нет сохранённых отчётов.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="⬅️ Назад",
+                                      callback_data="shift:report")]]))
+        await call.answer()
+        return
+    lines = ["📜 <b>История отчётов</b>\n"]
+    for month, spent, earned, saved, created in rows:
+        lines.append(
+            f"<b>{month}</b>\n"
+            f"  💸 Потрачено: {spent:g} ₽\n"
+            f"  💰 Заработано: {earned:g} ₽\n"
+            f"  🏦 Отложено: {saved:g} ₽\n"
+            f"  <i>Сформирован: {created[:16]}</i>\n")
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n…"
+    await call.message.edit_text(text, parse_mode="HTML",
+                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                     [InlineKeyboardButton(text="⬅️ Назад",
+                                                           callback_data="shift:report")]]))
+    await call.answer()
+
+
+# ============================================================
+#               ИНФОРМАЦИЯ ОБ ОПЕРАЦИЯХ
+# ============================================================
+def view_kind_kb(month: str):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="💰 Зачисления",
+                              callback_data=f"view:income:{month}")],
+        [InlineKeyboardButton(text="💸 Траты",
+                              callback_data=f"view:expense:{month}")],
+        [InlineKeyboardButton(text="📊 Все",
+                              callback_data=f"view:all:{month}")],
+        [InlineKeyboardButton(text="📤 Вывести данные за месяц (CSV)",
+                              callback_data=f"view:csv:{month}")],
+        [InlineKeyboardButton(text="⬅️ Назад",
+                              callback_data="view:menu")],
+    ])
+
+
+def back_to_menu_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="⬅️ В меню", callback_data="view:menu")]
+    ])
+
+
+def op_card_kb(op_id: int):
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✏️ Изменить примечание",
+                              callback_data=f"op_edit:{op_id}")],
+        [InlineKeyboardButton(text="🗑 Удалить операцию",
+                              callback_data=f"op_del:{op_id}")],
+        [InlineKeyboardButton(text="⬅️ Назад",
+                              callback_data="view:menu")],
+    ])
+
+
+def build_months_kb(user_id: int):
+    months = get_months(user_id)
+    if not months:
+        return InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⬅️ Назад", callback_data="view:menu")]])
+    buttons = [[InlineKeyboardButton(
+        text=f"{m.split('-')[1]}.{m.split('-')[0]}",
+        callback_data=f"view:pick:{m}")]
+        for m in months]
+    return InlineKeyboardMarkup(inline_keyboard=buttons)
+
+
+@dp.message(F.text == "📋 Информация о операциях")
+async def view_menu(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer("📋 <b>Информация о операциях</b>\n\nВыберите месяц:",
+                         parse_mode="HTML",
+                         reply_markup=build_months_kb(uid(message)))
+
+
+@dp.callback_query(F.data == "view:menu")
+async def view_menu_cb(call: CallbackQuery, state: FSMContext):
+    await state.clear()
+    await call.message.edit_text(
+        "📋 <b>Информация о операциях</b>\n\nВыберите месяц:",
+        parse_mode="HTML",
+        reply_markup=build_months_kb(uid(call)))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("view:pick:"))
+async def view_pick_month(call: CallbackQuery, state: FSMContext):
+    month = call.data.split(":", 2)[2]
+    await state.update_data(month=month)
+    await call.message.edit_text(
+        f"Месяц: <b>{month}</b>\n\nВыберите тип:",
+        parse_mode="HTML", reply_markup=view_kind_kb(month))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("view:income:") |
+                   F.data.startswith("view:expense:") |
+                   F.data.startswith("view:all:"))
+async def view_show(call: CallbackQuery, state: FSMContext):
+    parts = call.data.split(":", 2)
+    kind = parts[1]
+    month = parts[2]
+    kind_map = {"income": "income", "expense": "expense", "all": None}
+    ops = get_operations_for_month(uid(call), month, kind_map[kind])
+    if not ops:
+        await call.message.edit_text(f"За {month} ничего не найдено.",
+                                     reply_markup=back_to_menu_kb())
+        await call.answer()
+        return
+    lines = [f"📋 <b>Операции за {month}</b>\n"]
+    for op_id, k, number, total, reason, created in ops:
+        icon = "💰" if k == "income" else "💸"
+        lines.append(
+            f"{icon} <b>{number}</b>\n"
+            f"   Сумма: <b>{total:g}</b> ₽\n"
+            f"   Дата: {created[:16]}\n"
+            f"   Причина: {reason}")
+        if k == "expense":
+            items = get_operation_items(op_id)
+            if items:
+                lines.append("   Позиции:")
+                for amt, rsn in items:
+                    lines.append(f"     • {amt:g} ₽ — {rsn}")
+        lines.append("")
+
+    totals = get_month_totals(uid(call), month)
+    lines.append("━━━━━━━━━━━━━━━")
+    lines.append(f"💰 Всего зачислений: <b>{totals['income']:g}</b> ₽")
+    lines.append(f"💸 Всего трат: <b>{totals['expense']:g}</b> ₽")
+    lines.append(f"📊 Баланс: <b>{totals['income'] - totals['expense']:g}</b> ₽")
+
+    text = "\n".join(lines)
+    if len(text) > 4000:
+        text = text[:4000] + "\n…"
+    await call.message.edit_text(text, parse_mode="HTML",
+                                 reply_markup=back_to_menu_kb())
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("view:csv:"))
+async def view_csv(call: CallbackQuery, state: FSMContext):
+    month = call.data.split(":", 2)[2]
+    ops = get_operations_for_month(uid(call), month, None)
+    if not ops:
+        await call.answer("Нет данных.", show_alert=True)
+        return
+    lines = ["Номер;Тип;Сумма;Дата;Причина;Позиции"]
+    for op_id, k, number, total, reason, created in ops:
+        type_ru = "Зачисление" if k == "income" else "Трата"
+        items_str = ""
+        if k == "expense":
+            items = get_operation_items(op_id)
+            items_str = "; ".join(f"{amt:g} — {rsn}" for amt, rsn in items)
+        safe_reason = (reason or "").replace(";", ",").replace('"', '""')
+        safe_items = items_str.replace(";", ",").replace('"', '""')
+        lines.append(f'{number};{type_ru};{total:g};{created};'
+                     f'"{safe_reason}";"{safe_items}"')
+    csv_data = "\n".join(lines).encode("utf-8-sig")
+    file = BufferedInputFile(csv_data, filename=f"operations_{month}.csv")
+    await call.message.answer_document(file,
+                                       caption=f"📤 Данные за {month}")
+    await call.answer()
+
+
+# ---------- КАРТОЧКА ОПЕРАЦИИ ----------
+@dp.callback_query(F.data.startswith("op_view:"))
+async def op_view(call: CallbackQuery, state: FSMContext):
+    op_id = int(call.data.split(":")[1])
+    op = get_operation(op_id, uid(call))
+    if not op:
+        await call.answer("Операция не найдена.", show_alert=True)
+        return
+    _, kind, number, total, reason, created = op
+    icon = "💰" if kind == "income" else "💸"
+    lines = [
+        f"{icon} <b>{number}</b>",
+        f"Сумма: <b>{total:g}</b> ₽",
+        f"Дата: {created[:16]}",
+        f"Причина: {reason}",
+    ]
+    if kind == "expense":
+        items = get_operation_items(op_id)
+        if items:
+            lines.append("")
+            lines.append("Позиции:")
+            for amt, rsn in items:
+                lines.append(f"  • {amt:g} ₽ — {rsn}")
+    await call.message.edit_text("\n".join(lines), parse_mode="HTML",
+                                 reply_markup=op_card_kb(op_id))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("op_edit:"))
+async def op_edit_start(call: CallbackQuery, state: FSMContext):
+    op_id = int(call.data.split(":")[1])
+    await state.set_state(EditOpFlow.new_reason)
+    await state.update_data(op_id=op_id)
+    await call.message.edit_text("Введите новое примечание для операции:")
+    await call.answer()
+
+
+@dp.message(EditOpFlow.new_reason)
+async def op_edit_input(message: Message, state: FSMContext):
+    data = await state.get_data()
+    op_id = data["op_id"]
+    ok = update_operation_reason(op_id, uid(message), message.text.strip())
+    await state.clear()
+    if not ok:
+        await message.answer("Операция не найдена.",
+                             reply_markup=main_menu_kb())
+        return
+    await message.answer("✅ Примечание обновлено.",
+                         reply_markup=main_menu_kb())
+
+
+@dp.callback_query(F.data.startswith("op_del:"))
+async def op_del(call: CallbackQuery, state: FSMContext):
+    op_id = int(call.data.split(":")[1])
+    await call.message.edit_text(
+        f"🗑 Удалить операцию #{op_id}?",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="✅ Да",
+                                  callback_data=f"op_del_yes:{op_id}")],
+            [InlineKeyboardButton(text="❌ Нет",
+                                  callback_data=f"op_view:{op_id}")]]))
+    await call.answer()
+
+
+@dp.callback_query(F.data.startswith("op_del_yes:"))
+async def op_del_yes(call: CallbackQuery, state: FSMContext):
+    op_id = int(call.data.split(":")[1])
+    delete_operation(op_id, uid(call))
+    await call.message.edit_text("✅ Операция удалена.")
+    await call.message.answer("Главное меню:", reply_markup=main_menu_kb())
+    await call.answer()
+
+
+# ============================================================
+#               ПОИСК ОПЕРАЦИИ
+# ============================================================
+@dp.message(F.text == "🔎 Найти операцию")
+async def find_op_start(message: Message, state: FSMContext):
+    await state.clear()
+    await state.set_state(FindOpFlow.number)
+    await message.answer(
+        "Введите номер операции, например <code>Т:00001</code> "
+        "или <code>З:00001</code>:",
+        parse_mode="HTML")
+
+
+@dp.message(FindOpFlow.number)
+async def find_op_input(message: Message, state: FSMContext):
+    raw = message.text.strip().upper()
+    if not raw.startswith(("Т:", "З:")):
+        await message.answer("❗ Номер должен начинаться с Т: или З:.")
+        return
+    op = get_operation_by_number(uid(message), raw)
+    await state.clear()
+    if not op:
+        await message.answer(f"Операция {raw} не найдена.",
+                             reply_markup=main_menu_kb())
+        return
+    op_id, kind, number, total, reason, created = op
+    icon = "💰" if kind == "income" else "💸"
+    lines = [
+        f"{icon} <b>{number}</b>",
+        f"Сумма: <b>{total:g}</b> ₽",
+        f"Дата: {created[:16]}",
+        f"Причина: {reason}",
+    ]
+    if kind == "expense":
+        items = get_operation_items(op_id)
+        if items:
+            lines.append("")
+            lines.append("Позиции:")
+            for amt, rsn in items:
+                lines.append(f"  • {amt:g} ₽ — {rsn}")
+    await message.answer("\n".join(lines), parse_mode="HTML",
+                         reply_markup=op_card_kb(op_id))
+
+
+# ============================================================
+#               ПОСЛЕДНИЕ ОПЕРАЦИИ
+# ============================================================
+@dp.message(F.text == "🕓 Последние операции")
+async def last_ops(message: Message, state: FSMContext):
+    await state.clear()
+    rows = get_last_operations(uid(message), 10)
+    if not rows:
+        await message.answer("Пока нет операций.",
+                             reply_markup=main_menu_kb())
+        return
+    lines = ["🕓 <b>Последние 10 операций</b>\n"]
+    for op_id, kind, number, total, reason, created in rows:
+        icon = "💰" if kind == "income" else "💸"
+        lines.append(f"{icon} <b>{number}</b> | {total:g} ₽ | {created[:16]}")
+        lines.append(f"   {reason}")
+    await message.answer("\n".join(lines), parse_mode="HTML",
+                         reply_markup=main_menu_kb())
+
+
+# ============================================================
+#               СТАТИСТИКА
+# ============================================================
+@dp.message(F.text == "📊 Статистика")
+async def stats_menu(message: Message, state: FSMContext):
+    await state.clear()
+    months = get_months(uid(message))
+    if not months:
+        await message.answer("Пока нет данных.",
+                             reply_markup=main_menu_kb())
+        return
+    buttons = [[InlineKeyboardButton(
+        text=f"{m.split('-')[1]}.{m.split('-')[0]}",
+        callback_data=f"stats:{m}")] for m in months]
+    await message.answer("Выберите месяц:",
+                         reply_markup=InlineKeyboardMarkup(inline_keyboard=buttons))
+
+
+@dp.callback_query(F.data.startswith("stats:"))
+async def stats_show(call: CallbackQuery, state: FSMContext):
+    month = call.data.split(":", 1)[1]
+    user_id = uid(call)
+    totals = get_month_totals(user_id, month)
+
+    y, m = map(int, month.split("-"))
+    if m == 1:
+        prev_month = f"{y-1}-12"
+    else:
+        prev_month = f"{y}-{m-1:02d}"
+    prev_totals = get_month_totals(user_id, prev_month)
+
+    def diff_str(cur, prev):
+        if prev == 0:
+            if cur == 0:
+                return "—"
+            return f"{cur:g} ₽ (в прошлом периоде не было)"
+        d = cur - prev
+        pct = d / prev * 100
+        arrow = "🔺" if d > 0 else ("🔻" if d < 0 else "➖")
+        return f"{arrow} {pct:+.1f}% (было {prev:g} ₽)"
+
+    top = get_top_expense_reasons(user_id, month, 5)
+
+    lines = [f"📊 <b>Статистика за {month}</b>\n"]
+    lines.append(f"💰 Зачисления: <b>{totals['income']:g}</b> ₽")
+    lines.append(f"   {diff_str(totals['income'], prev_totals['income'])}")
+    lines.append(f"💸 Траты: <b>{totals['expense']:g}</b> ₽")
+    lines.append(f"   {diff_str(totals['expense'], prev_totals['expense'])}")
+    balance = totals["income"] - totals["expense"]
+    lines.append(f"📊 Баланс: <b>{balance:g}</b> ₽")
+
+    if top:
+        lines.append("")
+        lines.append("🏆 <b>Топ-5 причин трат:</b>")
+        for rsn, s in top:
+            lines.append(f"  • {rsn}: <b>{s:g}</b> ₽")
+
+    await call.message.edit_text("\n".join(lines), parse_mode="HTML",
+                                 reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                                     [InlineKeyboardButton(text="⬅️ В меню",
+                                                           callback_data="view:menu")]]))
+    await call.answer()
+
+
+# ============================================================
+#               ОТЧЁТ ЗА МЕСЯЦ (общий)
+# ============================================================
+@dp.message(F.text == "📅 Отчёт за месяц")
+async def month_report_main(message: Message, state: FSMContext):
+    await state.clear()
+    await message.answer(
+        "📅 <b>Отчёт за месяц</b>\n\nВыберите действие:",
+        parse_mode="HTML",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="🆕 Сформировать за месяц",
+                                  callback_data="mreport:create")],
+            [InlineKeyboardButton(text="📜 История отчётов",
+                                  callback_data="mreport:history")],
+        ]))
+
+
+# ============================================================
+#               АВТООТЧЁТ 30-го ЧИСЛА
+# ============================================================
+async def auto_month_reports():
+    from datetime import timezone
+    now = datetime.now(timezone.utc) + timedelta(hours=3)
+    if now.day != 30:
+        return
+    month = now.strftime("%Y-%m")
+    for user_id in get_auto_report_users():
+        if was_auto_report_sent(user_id, month):
+            continue
+        try:
+            totals = get_month_totals(user_id, month)
+            spent = totals["expense"]
+            saved = get_system_goal_current(user_id, SAVED_BUDGET_NAME)
+            earned = get_system_goal_current(user_id, FUTURE_BUDGET_NAME)
+            save_monthly_report(user_id, month, spent, earned, saved)
+
+            tg_id = get_tg_by_user_id(user_id)
+            if tg_id:
+                text = (
+                    f"📅 <b>Автоотчёт за {month}</b>\n\n"
+                    f"💸 Потрачено: <b>{spent:g}</b> ₽\n"
+                    f"💰 Заработано: <b>{earned:g}</b> ₽\n"
+                    f"🏦 Отложено: <b>{saved:g}</b> ₽"
+                )
+                try:
+                    await bot.send_message(tg_id, text, parse_mode="HTML")
+                except Exception as e:
+                    logging.warning(f"Не отправить автоотчёт {user_id}: {e}")
+            mark_auto_report_sent(user_id, month)
+        except Exception as e:
+            logging.warning(f"Ошибка автоотчёта {user_id}: {e}")
+
+
+# ============================================================
+#                     ЗАПУСК
+# ============================================================
+async def main():
+    init_db()
+    init_shift_tables()
+
+    scheduler.add_job(auto_month_reports, "cron", minute="0")
+    scheduler.start()
+
+    print("Бот запущен...")
+    try:
+        await dp.start_polling(bot)
+    finally:
+        scheduler.shutdown(wait=False)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
